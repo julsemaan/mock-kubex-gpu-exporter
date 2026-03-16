@@ -53,6 +53,7 @@ Environment variables:
 
 - `NODE_NAME` required
 - `LISTEN_ADDR` optional, defaults to `:8080`
+- `METRIC_JITTER_ABSOLUTE_DELTA` optional, defaults to `0`; when set to a positive float, `kubex_gpu_fraction` and the `*_percent` metrics get a new additive jitter sampled from `[-delta, +delta]` on every scrape and then clamped to their valid ranges
 
 ## Example pod
 

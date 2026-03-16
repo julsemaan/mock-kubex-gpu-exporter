@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -24,12 +26,13 @@ import (
 )
 
 const (
-	defaultListenAddr       = ":8080"
-	gpuFractionAnnotation   = "gpu-fraction"
-	targetContainerAnnot    = "gpu-fraction-container-name"
-	mockAnnotationPrefix    = "mock.kubex.ai/"
-	mockGPUUUIDAnnotation   = mockAnnotationPrefix + "gpu-uuid"
-	defaultMockGPUUUIDLabel = "mock-%s"
+	defaultListenAddr            = ":8080"
+	metricJitterAbsoluteDeltaEnv = "METRIC_JITTER_ABSOLUTE_DELTA"
+	gpuFractionAnnotation        = "gpu-fraction"
+	targetContainerAnnot         = "gpu-fraction-container-name"
+	mockAnnotationPrefix         = "mock.kubex.ai/"
+	mockGPUUUIDAnnotation        = mockAnnotationPrefix + "gpu-uuid"
+	defaultMockGPUUUIDLabel      = "mock-%s"
 )
 
 var labelNames = []string{"gpu_uuid", "node", "namespace", "pod", "container"}
@@ -40,6 +43,7 @@ var metricDefinitions = []metricDefinition{
 		Help:           "GPU fraction annotation",
 		AnnotationKey:  gpuFractionAnnotation,
 		AnnotationName: gpuFractionAnnotation,
+		JitterPolicy:   jitterFraction,
 	},
 	{
 		Name:           "kubex_gpu_container_memory_bytes",
@@ -52,44 +56,59 @@ var metricDefinitions = []metricDefinition{
 		Help:           "Percent",
 		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent",
 		AnnotationName: "kubex_gpu_container_sm_utilization_percent",
+		JitterPolicy:   jitterPercent,
 	},
 	{
 		Name:           "kubex_gpu_container_enc_utilization_percent",
 		Help:           "Percent",
 		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_enc_utilization_percent",
 		AnnotationName: "kubex_gpu_container_enc_utilization_percent",
+		JitterPolicy:   jitterPercent,
 	},
 	{
 		Name:           "kubex_gpu_container_dec_utilization_percent",
 		Help:           "Percent",
 		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_dec_utilization_percent",
 		AnnotationName: "kubex_gpu_container_dec_utilization_percent",
+		JitterPolicy:   jitterPercent,
 	},
 	{
 		Name:           "kubex_gpu_container_memory_utilization_percent",
 		Help:           "Percent",
 		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_memory_utilization_percent",
 		AnnotationName: "kubex_gpu_container_memory_utilization_percent",
+		JitterPolicy:   jitterPercent,
 	},
 	{
 		Name:           "kubex_gpu_container_memory_footprint_percent",
 		Help:           "Percent",
 		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_memory_footprint_percent",
 		AnnotationName: "kubex_gpu_container_memory_footprint_percent",
+		JitterPolicy:   jitterPercent,
 	},
 }
+
+type jitterPolicy uint8
+
+const (
+	jitterNone jitterPolicy = iota
+	jitterFraction
+	jitterPercent
+)
 
 type metricDefinition struct {
 	Name           string
 	Help           string
 	AnnotationKey  string
 	AnnotationName string
+	JitterPolicy   jitterPolicy
 }
 
 type metricSeries struct {
 	metricName string
 	labels     []string
 	value      float64
+	jitter     jitterPolicy
 }
 
 func (s metricSeries) key() string {
@@ -100,9 +119,16 @@ type exporter struct {
 	nodeName string
 	logger   *log.Logger
 
-	mu        sync.Mutex
-	metrics   map[string]*prometheus.GaugeVec
-	podSeries map[types.UID]map[string]metricSeries
+	mu          sync.Mutex
+	metrics     map[string]*prometheus.GaugeVec
+	podSeries   map[types.UID]map[string]metricSeries
+	jitterDelta float64
+	randValue   func() float64
+}
+
+type exporterOptions struct {
+	jitterDelta float64
+	randValue   func() float64
 }
 
 func main() {
@@ -114,9 +140,13 @@ func main() {
 	}
 
 	listenAddr := envOrDefault("LISTEN_ADDR", defaultListenAddr)
+	jitterDelta, err := loadMetricJitterDelta()
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	registry := prometheus.NewRegistry()
-	exp := newExporter(nodeName, registry, logger)
+	exp := newExporter(nodeName, registry, logger, exporterOptions{jitterDelta: jitterDelta})
 
 	clientset, err := newClientset()
 	if err != nil {
@@ -142,7 +172,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", exp.metricsHandler(registry))
 
 	logger.Printf("starting mock gpu exporter on %s", listenAddr)
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {
@@ -182,7 +212,7 @@ func newPodInformer(clientset kubernetes.Interface, nodeName string) cache.Share
 	)
 }
 
-func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger) *exporter {
+func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger, opts exporterOptions) *exporter {
 	metrics := make(map[string]*prometheus.GaugeVec, len(metricDefinitions))
 	for _, def := range metricDefinitions {
 		gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -196,13 +226,27 @@ func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
+	if opts.randValue == nil {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		opts.randValue = rng.Float64
+	}
 
 	return &exporter{
-		nodeName:  nodeName,
-		logger:    logger,
-		metrics:   metrics,
-		podSeries: make(map[types.UID]map[string]metricSeries),
+		nodeName:    nodeName,
+		logger:      logger,
+		metrics:     metrics,
+		podSeries:   make(map[types.UID]map[string]metricSeries),
+		jitterDelta: opts.jitterDelta,
+		randValue:   opts.randValue,
 	}
+}
+
+func (e *exporter) metricsHandler(gatherer prometheus.Gatherer) http.Handler {
+	handler := promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		e.refreshMetricsForScrape()
+		handler.ServeHTTP(w, r)
+	})
 }
 
 func (e *exporter) onAdd(obj interface{}) {
@@ -283,6 +327,7 @@ func (e *exporter) desiredSeriesForPod(pod *corev1.Pod) map[string]metricSeries 
 			metricName: def.Name,
 			labels:     append([]string(nil), labels...),
 			value:      value,
+			jitter:     def.JitterPolicy,
 		}
 		seriesByKey[series.key()] = series
 	}
@@ -319,6 +364,22 @@ func (e *exporter) applySeries(podUID types.UID, desired map[string]metricSeries
 	}
 }
 
+func (e *exporter) refreshMetricsForScrape() {
+	if e.jitterDelta <= 0 {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, seriesByKey := range e.podSeries {
+		for _, series := range seriesByKey {
+			value := e.jitteredValue(series)
+			e.metrics[series.metricName].WithLabelValues(series.labels...).Set(value)
+		}
+	}
+}
+
 func (e *exporter) removePodSeries(podUID types.UID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -328,6 +389,24 @@ func (e *exporter) removePodSeries(podUID types.UID) {
 		e.metrics[series.metricName].DeleteLabelValues(series.labels...)
 	}
 	delete(e.podSeries, podUID)
+}
+
+func (e *exporter) jitteredValue(series metricSeries) float64 {
+	if e.jitterDelta <= 0 || series.jitter == jitterNone {
+		return series.value
+	}
+
+	delta := (e.randValue()*2 - 1) * e.jitterDelta
+	value := series.value + delta
+
+	switch series.jitter {
+	case jitterFraction:
+		return clamp(value, 0, 1)
+	case jitterPercent:
+		return clamp(value, 0, 100)
+	default:
+		return value
+	}
 }
 
 func resolveContainerName(pod *corev1.Pod) string {
@@ -377,6 +456,33 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func loadMetricJitterDelta() (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(metricJitterAbsoluteDeltaEnv))
+	if raw == "" {
+		return 0, nil
+	}
+
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a non-negative float: %w", metricJitterAbsoluteDeltaEnv, err)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative float", metricJitterAbsoluteDeltaEnv)
+	}
+
+	return value, nil
+}
+
+func clamp(value, min, max float64) float64 {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func pod(namespace, name, nodeName string, annotations map[string]string, containers ...string) *corev1.Pod {
