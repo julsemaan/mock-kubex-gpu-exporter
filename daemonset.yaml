@@ -48,7 +48,7 @@ spec:
         nvidia.com/gpu.present: "true"
       containers:
         - name: exporter
-          image: ghcr.io/your-org/mock-kubex-gpu-exporter:latest
+          image: ghcr.io/julsemaan/mock-kubex-gpu-exporter:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_NAME

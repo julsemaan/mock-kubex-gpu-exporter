@@ -83,3 +83,7 @@ spec:
 ## Deployment
 
 `daemonset.yaml` contains a minimal ServiceAccount, RBAC, DaemonSet, and Service for cluster deployment. Unlike the real exporter, it does not require privileged mode, `hostPID`, or host library mounts.
+
+## Container image
+
+The repository includes a GitHub Actions workflow that builds the exporter image and publishes it to `ghcr.io/<owner>/mock-kubex-gpu-exporter` on pushes to `main` and version tags like `v1.2.3`.
