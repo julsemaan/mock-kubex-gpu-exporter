@@ -3,13 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -26,92 +24,38 @@ import (
 )
 
 const (
-	defaultListenAddr            = ":8080"
-	metricJitterAbsoluteDeltaEnv = "METRIC_JITTER_ABSOLUTE_DELTA"
-	gpuFractionAnnotation        = "gpu-fraction"
-	targetContainerAnnot         = "gpu-fraction-container-name"
-	mockAnnotationPrefix         = "mock.kubex.ai/"
-	mockGPUUUIDAnnotation        = mockAnnotationPrefix + "gpu-uuid"
-	defaultMockGPUUUIDLabel      = "mock-%s"
+	defaultListenAddr          = ":8080"
+	gpuFractionAnnotation      = "gpu-fraction"
+	targetContainerAnnot       = "gpu-fraction-container-name"
+	mockAnnotationPrefix       = "mock.kubex.ai/"
+	mockGPUUUIDAnnotation      = mockAnnotationPrefix + "gpu-uuid"
+	mockGPUModelAnnotation     = mockAnnotationPrefix + "gpu-model"
+	defaultMockGPUUUIDLabel    = "mock-%s"
+	defaultMockGPUModelLabel   = "mock-gpu"
+	kaiSchedulerAllocationType = "KaiScheduler"
 )
 
-var labelNames = []string{"gpu_uuid", "node", "namespace", "pod", "container"}
-
-var metricDefinitions = []metricDefinition{
-	{
-		Name:           "kubex_gpu_fraction",
-		Help:           "GPU fraction annotation",
-		AnnotationKey:  gpuFractionAnnotation,
-		AnnotationName: gpuFractionAnnotation,
-		JitterPolicy:   jitterFraction,
-	},
-	{
-		Name:           "kubex_gpu_container_memory_bytes",
-		Help:           "Bytes",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_memory_bytes",
-		AnnotationName: "kubex_gpu_container_memory_bytes",
-	},
-	{
-		Name:           "kubex_gpu_container_sm_utilization_percent",
-		Help:           "Percent",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent",
-		AnnotationName: "kubex_gpu_container_sm_utilization_percent",
-		JitterPolicy:   jitterPercent,
-	},
-	{
-		Name:           "kubex_gpu_container_enc_utilization_percent",
-		Help:           "Percent",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_enc_utilization_percent",
-		AnnotationName: "kubex_gpu_container_enc_utilization_percent",
-		JitterPolicy:   jitterPercent,
-	},
-	{
-		Name:           "kubex_gpu_container_dec_utilization_percent",
-		Help:           "Percent",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_dec_utilization_percent",
-		AnnotationName: "kubex_gpu_container_dec_utilization_percent",
-		JitterPolicy:   jitterPercent,
-	},
-	{
-		Name:           "kubex_gpu_container_memory_utilization_percent",
-		Help:           "Percent",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_memory_utilization_percent",
-		AnnotationName: "kubex_gpu_container_memory_utilization_percent",
-		JitterPolicy:   jitterPercent,
-	},
-	{
-		Name:           "kubex_gpu_container_memory_footprint_percent",
-		Help:           "Percent",
-		AnnotationKey:  mockAnnotationPrefix + "kubex_gpu_container_memory_footprint_percent",
-		AnnotationName: "kubex_gpu_container_memory_footprint_percent",
-		JitterPolicy:   jitterPercent,
-	},
-}
-
-type jitterPolicy uint8
+var containerLabelNames = []string{"node", "namespace", "pod", "container", "container_id", "gpu_allocation_type"}
+var perDeviceLabelNames = []string{"node", "namespace", "pod", "container", "container_id", "gpu_allocation_type", "gpu_uuid", "gpu_model"}
 
 const (
-	jitterNone jitterPolicy = iota
-	jitterFraction
-	jitterPercent
+	metricRequestsName        = "kubex_gpu_container_requests"
+	metricLimitsName          = "kubex_gpu_container_limits"
+	metricMemoryFootprintName = "kubex_gpu_container_memory_footprint_percent"
+	metricSMUtilName          = "kubex_gpu_container_sm_utilization_percent"
+
+	metricMemoryBytesAnnotation      = mockAnnotationPrefix + "kubex_gpu_container_memory_bytes"
+	metricMemoryTotalBytesAnnotation = mockAnnotationPrefix + "kubex_gpu_container_memory_total_bytes"
+	metricSMUtilPercentAnnotation    = mockAnnotationPrefix + metricSMUtilName
 )
 
-type metricDefinition struct {
-	Name           string
-	Help           string
-	AnnotationKey  string
-	AnnotationName string
-	JitterPolicy   jitterPolicy
-}
-
-type metricSeries struct {
+type gaugeSeries struct {
 	metricName string
 	labels     []string
 	value      float64
-	jitter     jitterPolicy
 }
 
-func (s metricSeries) key() string {
+func (s gaugeSeries) key() string {
 	return s.metricName + "\xff" + strings.Join(s.labels, "\xff")
 }
 
@@ -119,17 +63,12 @@ type exporter struct {
 	nodeName string
 	logger   *log.Logger
 
-	mu          sync.Mutex
-	metrics     map[string]*prometheus.GaugeVec
-	podSeries   map[types.UID]map[string]metricSeries
-	jitterDelta float64
-	randValue   func() float64
+	mu           sync.Mutex
+	gaugeMetrics map[string]*prometheus.GaugeVec
+	podGauges    map[types.UID]map[string]gaugeSeries
 }
 
-type exporterOptions struct {
-	jitterDelta float64
-	randValue   func() float64
-}
+type exporterOptions struct{}
 
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -140,13 +79,9 @@ func main() {
 	}
 
 	listenAddr := envOrDefault("LISTEN_ADDR", defaultListenAddr)
-	jitterDelta, err := loadMetricJitterDelta()
-	if err != nil {
-		logger.Fatal(err)
-	}
 
 	registry := prometheus.NewRegistry()
-	exp := newExporter(nodeName, registry, logger, exporterOptions{jitterDelta: jitterDelta})
+	exp := newExporter(nodeName, registry, logger, exporterOptions{})
 
 	clientset, err := newClientset()
 	if err != nil {
@@ -212,41 +147,31 @@ func newPodInformer(clientset kubernetes.Interface, nodeName string) cache.Share
 	)
 }
 
-func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger, opts exporterOptions) *exporter {
-	metrics := make(map[string]*prometheus.GaugeVec, len(metricDefinitions))
-	for _, def := range metricDefinitions {
-		gauge := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: def.Name,
-			Help: def.Help,
-		}, labelNames)
+func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger, _ exporterOptions) *exporter {
+	gaugeMetrics := map[string]*prometheus.GaugeVec{
+		metricRequestsName:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricRequestsName, Help: "Number or fraction of GPUs"}, containerLabelNames),
+		metricLimitsName:          prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricLimitsName, Help: "Number or fraction of GPUs"}, containerLabelNames),
+		metricMemoryFootprintName: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricMemoryFootprintName, Help: "Percent"}, perDeviceLabelNames),
+		metricSMUtilName:          prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricSMUtilName, Help: "Percent"}, perDeviceLabelNames),
+	}
+	for _, gauge := range gaugeMetrics {
 		registerer.MustRegister(gauge)
-		metrics[def.Name] = gauge
 	}
 
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
-	if opts.randValue == nil {
-		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-		opts.randValue = rng.Float64
-	}
 
 	return &exporter{
-		nodeName:    nodeName,
-		logger:      logger,
-		metrics:     metrics,
-		podSeries:   make(map[types.UID]map[string]metricSeries),
-		jitterDelta: opts.jitterDelta,
-		randValue:   opts.randValue,
+		nodeName:     nodeName,
+		logger:       logger,
+		gaugeMetrics: gaugeMetrics,
+		podGauges:    make(map[types.UID]map[string]gaugeSeries),
 	}
 }
 
 func (e *exporter) metricsHandler(gatherer prometheus.Gatherer) http.Handler {
-	handler := promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		e.refreshMetricsForScrape()
-		handler.ServeHTTP(w, r)
-	})
+	return promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})
 }
 
 func (e *exporter) onAdd(obj interface{}) {
@@ -283,11 +208,11 @@ func (e *exporter) reconcilePod(pod *corev1.Pod) {
 		return
 	}
 
-	desired := e.desiredSeriesForPod(pod)
-	e.applySeries(pod.UID, desired)
+	desiredGauges := e.desiredSeriesForPod(pod)
+	e.applySeries(pod.UID, desiredGauges)
 }
 
-func (e *exporter) desiredSeriesForPod(pod *corev1.Pod) map[string]metricSeries {
+func (e *exporter) desiredSeriesForPod(pod *corev1.Pod) map[string]gaugeSeries {
 	if pod == nil || isTerminalPod(pod) {
 		return nil
 	}
@@ -297,86 +222,81 @@ func (e *exporter) desiredSeriesForPod(pod *corev1.Pod) map[string]metricSeries 
 		return nil
 	}
 
+	containerID := fmt.Sprintf("mock://%s/%s", pod.UID, containerName)
 	gpuUUID := pod.Annotations[mockGPUUUIDAnnotation]
 	if gpuUUID == "" {
 		gpuUUID = fmt.Sprintf(defaultMockGPUUUIDLabel, e.nodeName)
 	}
+	gpuModel := strings.TrimSpace(pod.Annotations[mockGPUModelAnnotation])
+	if gpuModel == "" {
+		gpuModel = defaultMockGPUModelLabel
+	}
+	containerLabels := []string{e.nodeName, pod.Namespace, pod.Name, containerName, containerID, kaiSchedulerAllocationType}
+	perDeviceLabels := append(append([]string(nil), containerLabels...), gpuUUID, gpuModel)
 
-	labels := []string{gpuUUID, e.nodeName, pod.Namespace, pod.Name, containerName}
-	seriesByKey := make(map[string]metricSeries, len(metricDefinitions))
+	gaugeSeriesByKey := make(map[string]gaugeSeries, 4)
 
-	for _, def := range metricDefinitions {
-		rawValue, ok := pod.Annotations[def.AnnotationKey]
-		if !ok || strings.TrimSpace(rawValue) == "" {
-			continue
+	if fraction, ok := parseAnnotationFloat(e, pod, gpuFractionAnnotation); ok {
+		fraction = clamp(fraction, 0, 1)
+		for _, metricName := range []string{metricRequestsName, metricLimitsName} {
+			series := gaugeSeries{metricName: metricName, labels: append([]string(nil), containerLabels...), value: fraction}
+			gaugeSeriesByKey[series.key()] = series
 		}
-
-		value, err := strconv.ParseFloat(strings.TrimSpace(rawValue), 64)
-		if err != nil {
-			e.logger.Printf(
-				"skipping invalid annotation %q on %s/%s: %v",
-				def.AnnotationName,
-				pod.Namespace,
-				pod.Name,
-				err,
-			)
-			continue
-		}
-
-		series := metricSeries{
-			metricName: def.Name,
-			labels:     append([]string(nil), labels...),
-			value:      value,
-			jitter:     def.JitterPolicy,
-		}
-		seriesByKey[series.key()] = series
 	}
 
-	return seriesByKey
+	memoryBytes, hasMemoryBytes := parseAnnotationFloat(e, pod, metricMemoryBytesAnnotation)
+	memoryTotalBytes, hasMemoryTotalBytes := parseAnnotationFloat(e, pod, metricMemoryTotalBytesAnnotation)
+	if hasMemoryBytes && hasMemoryTotalBytes && memoryTotalBytes > 0 {
+		footprint := clamp((memoryBytes/memoryTotalBytes)*100, 0, 100)
+		series := gaugeSeries{metricName: metricMemoryFootprintName, labels: append([]string(nil), perDeviceLabels...), value: footprint}
+		gaugeSeriesByKey[series.key()] = series
+	}
+
+	if smUtilPercent, ok := parseAnnotationFloat(e, pod, metricSMUtilPercentAnnotation); ok {
+		series := gaugeSeries{metricName: metricSMUtilName, labels: append([]string(nil), perDeviceLabels...), value: clamp(smUtilPercent, 0, 100)}
+		gaugeSeriesByKey[series.key()] = series
+	}
+
+	return gaugeSeriesByKey
 }
 
-func (e *exporter) applySeries(podUID types.UID, desired map[string]metricSeries) {
+func parseAnnotationFloat(e *exporter, pod *corev1.Pod, annotationKey string) (float64, bool) {
+	rawValue, ok := pod.Annotations[annotationKey]
+	if !ok || strings.TrimSpace(rawValue) == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(rawValue), 64)
+	if err != nil {
+		e.logger.Printf("skipping invalid annotation %q on %s/%s: %v", annotationKey, pod.Namespace, pod.Name, err)
+		return 0, false
+	}
+	return value, true
+}
+
+func (e *exporter) applySeries(podUID types.UID, desiredGauges map[string]gaugeSeries) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	existing := e.podSeries[podUID]
-	for key, oldSeries := range existing {
-		if _, ok := desired[key]; ok {
+	existingGauges := e.podGauges[podUID]
+	for key, oldSeries := range existingGauges {
+		if _, ok := desiredGauges[key]; ok {
 			continue
 		}
-		e.metrics[oldSeries.metricName].DeleteLabelValues(oldSeries.labels...)
-		delete(existing, key)
+		e.gaugeMetrics[oldSeries.metricName].DeleteLabelValues(oldSeries.labels...)
+		delete(existingGauges, key)
 	}
 
-	if len(desired) == 0 {
-		delete(e.podSeries, podUID)
+	if len(desiredGauges) == 0 {
+		delete(e.podGauges, podUID)
 		return
 	}
-
-	if existing == nil {
-		existing = make(map[string]metricSeries, len(desired))
-		e.podSeries[podUID] = existing
+	if existingGauges == nil {
+		existingGauges = make(map[string]gaugeSeries, len(desiredGauges))
+		e.podGauges[podUID] = existingGauges
 	}
-
-	for key, series := range desired {
-		e.metrics[series.metricName].WithLabelValues(series.labels...).Set(series.value)
-		existing[key] = series
-	}
-}
-
-func (e *exporter) refreshMetricsForScrape() {
-	if e.jitterDelta <= 0 {
-		return
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	for _, seriesByKey := range e.podSeries {
-		for _, series := range seriesByKey {
-			value := e.jitteredValue(series)
-			e.metrics[series.metricName].WithLabelValues(series.labels...).Set(value)
-		}
+	for key, series := range desiredGauges {
+		e.gaugeMetrics[series.metricName].WithLabelValues(series.labels...).Set(series.value)
+		existingGauges[key] = series
 	}
 }
 
@@ -384,29 +304,10 @@ func (e *exporter) removePodSeries(podUID types.UID) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	existing := e.podSeries[podUID]
-	for _, series := range existing {
-		e.metrics[series.metricName].DeleteLabelValues(series.labels...)
+	for _, series := range e.podGauges[podUID] {
+		e.gaugeMetrics[series.metricName].DeleteLabelValues(series.labels...)
 	}
-	delete(e.podSeries, podUID)
-}
-
-func (e *exporter) jitteredValue(series metricSeries) float64 {
-	if e.jitterDelta <= 0 || series.jitter == jitterNone {
-		return series.value
-	}
-
-	delta := (e.randValue()*2 - 1) * e.jitterDelta
-	value := series.value + delta
-
-	switch series.jitter {
-	case jitterFraction:
-		return clamp(value, 0, 1)
-	case jitterPercent:
-		return clamp(value, 0, 100)
-	default:
-		return value
-	}
+	delete(e.podGauges, podUID)
 }
 
 func resolveContainerName(pod *corev1.Pod) string {
@@ -456,23 +357,6 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func loadMetricJitterDelta() (float64, error) {
-	raw := strings.TrimSpace(os.Getenv(metricJitterAbsoluteDeltaEnv))
-	if raw == "" {
-		return 0, nil
-	}
-
-	value, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a non-negative float: %w", metricJitterAbsoluteDeltaEnv, err)
-	}
-	if value < 0 {
-		return 0, fmt.Errorf("%s must be a non-negative float", metricJitterAbsoluteDeltaEnv)
-	}
-
-	return value, nil
 }
 
 func clamp(value, min, max float64) float64 {

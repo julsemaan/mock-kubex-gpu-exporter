@@ -16,64 +16,148 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func TestReconcileAnnotatedPodExportsExpectedMetrics(t *testing.T) {
+func TestReconcileAnnotatedPodExportsConsumedMetrics(t *testing.T) {
 	exp, registry := testExporter(t)
 
 	p := pod("default", "gpu-app", "node-a", map[string]string{
-		gpuFractionAnnotation: "0.25",
-		mockGPUUUIDAnnotation: "GPU-123",
-		mockAnnotationPrefix + "kubex_gpu_container_memory_bytes":           "2048",
-		mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent": "73.5",
+		gpuFractionAnnotation:            "0.25",
+		mockGPUUUIDAnnotation:            "GPU-123",
+		mockGPUModelAnnotation:           "H100",
+		metricMemoryBytesAnnotation:      "2048",
+		metricMemoryTotalBytesAnnotation: "4096",
+		metricSMUtilPercentAnnotation:    "73.5",
 	}, "main")
 
 	exp.reconcilePod(p)
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
 
-	assertGaugeValue(t, registry, "kubex_gpu_fraction", map[string]string{
-		"gpu_uuid":  "GPU-123",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 0.25)
-	assertGaugeValue(t, registry, "kubex_gpu_container_memory_bytes", map[string]string{
-		"gpu_uuid":  "GPU-123",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 2048)
-	assertGaugeValue(t, registry, "kubex_gpu_container_sm_utilization_percent", map[string]string{
-		"gpu_uuid":  "GPU-123",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 73.5)
+	containerLabels := map[string]string{
+		"node":                "node-a",
+		"namespace":           "default",
+		"pod":                 "gpu-app",
+		"container":           "main",
+		"container_id":        "mock://default/gpu-app/main",
+		"gpu_allocation_type": kaiSchedulerAllocationType,
+	}
+	perDeviceLabels := copyLabels(containerLabels)
+	perDeviceLabels["gpu_uuid"] = "GPU-123"
+	perDeviceLabels["gpu_model"] = "H100"
+
+	assertMetricValueFromText(t, body, metricRequestsName, containerLabels, 0.25)
+	assertMetricValueFromText(t, body, metricLimitsName, containerLabels, 0.25)
+	assertMetricValueFromText(t, body, metricMemoryFootprintName, perDeviceLabels, 50)
+	assertMetricValueFromText(t, body, metricSMUtilName, perDeviceLabels, 73.5)
+
+	assertMetricAbsentFromText(t, body, "kubex_gpu_fraction")
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_bytes")
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_total_bytes")
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_sm_utilization_percent_seconds_total")
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_utilization_percent")
+}
+
+func TestDefaultsIncludeSyntheticLabels(t *testing.T) {
+	exp, registry := testExporter(t)
+
+	p := pod("default", "gpu-app", "node-a", map[string]string{
+		gpuFractionAnnotation:            "0.5",
+		metricMemoryBytesAnnotation:      "1024",
+		metricMemoryTotalBytesAnnotation: "2048",
+		metricSMUtilPercentAnnotation:    "17",
+	}, "main")
+
+	exp.reconcilePod(p)
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
+
+	labels := map[string]string{
+		"node":                "node-a",
+		"namespace":           "default",
+		"pod":                 "gpu-app",
+		"container":           "main",
+		"container_id":        "mock://default/gpu-app/main",
+		"gpu_allocation_type": kaiSchedulerAllocationType,
+		"gpu_uuid":            "mock-node-a",
+		"gpu_model":           defaultMockGPUModelLabel,
+	}
+
+	assertMetricValueFromText(t, body, metricMemoryFootprintName, labels, 50)
+	assertMetricValueFromText(t, body, metricSMUtilName, labels, 17)
 }
 
 func TestUpdateChangesValuesAndDeletesRemovedMetrics(t *testing.T) {
 	exp, registry := testExporter(t)
 
 	p := pod("default", "gpu-app", "node-a", map[string]string{
-		gpuFractionAnnotation: "0.25",
-		mockAnnotationPrefix + "kubex_gpu_container_memory_bytes": "2048",
+		gpuFractionAnnotation:            "0.25",
+		metricMemoryBytesAnnotation:      "2048",
+		metricMemoryTotalBytesAnnotation: "4096",
+		metricSMUtilPercentAnnotation:    "33",
 	}, "main")
 	exp.reconcilePod(p)
 
 	updated := p.DeepCopy()
 	updated.Annotations = map[string]string{
-		mockAnnotationPrefix + "kubex_gpu_container_memory_bytes": "1024",
+		metricMemoryBytesAnnotation:      "1024",
+		metricMemoryTotalBytesAnnotation: "2048",
 	}
 	exp.reconcilePod(updated)
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
 
-	assertGaugeAbsent(t, registry, "kubex_gpu_fraction")
-	assertGaugeValue(t, registry, "kubex_gpu_container_memory_bytes", map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 1024)
+	containerLabels := map[string]string{
+		"node":                "node-a",
+		"namespace":           "default",
+		"pod":                 "gpu-app",
+		"container":           "main",
+		"container_id":        "mock://default/gpu-app/main",
+		"gpu_allocation_type": kaiSchedulerAllocationType,
+	}
+	perDeviceLabels := copyLabels(containerLabels)
+	perDeviceLabels["gpu_uuid"] = "mock-node-a"
+	perDeviceLabels["gpu_model"] = defaultMockGPUModelLabel
+
+	assertMetricAbsentFromText(t, body, metricRequestsName)
+	assertMetricValueFromText(t, body, metricMemoryFootprintName, perDeviceLabels, 50)
+	assertMetricAbsentFromText(t, body, metricSMUtilName)
+}
+
+func TestInvalidAnnotationDoesNotLeakStaleMetric(t *testing.T) {
+	exp, registry := testExporter(t)
+
+	p := pod("default", "gpu-app", "node-a", map[string]string{
+		metricMemoryBytesAnnotation:      "1024",
+		metricMemoryTotalBytesAnnotation: "2048",
+		metricSMUtilPercentAnnotation:    "10",
+	}, "main")
+	exp.reconcilePod(p)
+
+	updated := p.DeepCopy()
+	updated.Annotations[metricMemoryTotalBytesAnnotation] = "nope"
+	updated.Annotations[metricSMUtilPercentAnnotation] = "bad"
+	exp.reconcilePod(updated)
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
+
+	assertMetricAbsentFromText(t, body, metricMemoryFootprintName)
+	assertMetricAbsentFromText(t, body, metricSMUtilName)
+}
+
+func TestMissingOrZeroMemoryTotalSkipsFootprint(t *testing.T) {
+	t.Run("missing total", func(t *testing.T) {
+		exp, registry := testExporter(t)
+		exp.reconcilePod(pod("default", "gpu-app", "node-a", map[string]string{
+			metricMemoryBytesAnnotation: "1024",
+		}, "main"))
+		body := scrapeMetrics(t, exp.metricsHandler(registry))
+		assertMetricAbsentFromText(t, body, metricMemoryFootprintName)
+	})
+
+	t.Run("zero total", func(t *testing.T) {
+		exp, registry := testExporter(t)
+		exp.reconcilePod(pod("default", "gpu-app", "node-a", map[string]string{
+			metricMemoryBytesAnnotation:      "1024",
+			metricMemoryTotalBytesAnnotation: "0",
+		}, "main"))
+		body := scrapeMetrics(t, exp.metricsHandler(registry))
+		assertMetricAbsentFromText(t, body, metricMemoryFootprintName)
+	})
 }
 
 func TestDeleteRemovesSeries(t *testing.T) {
@@ -85,40 +169,8 @@ func TestDeleteRemovesSeries(t *testing.T) {
 	exp.reconcilePod(p)
 	exp.onDelete(p)
 
-	assertGaugeAbsent(t, registry, "kubex_gpu_fraction")
-}
-
-func TestResolvesAnnotatedContainerName(t *testing.T) {
-	exp, registry := testExporter(t)
-
-	p := pod("default", "gpu-app", "node-a", map[string]string{
-		gpuFractionAnnotation: "0.5",
-		targetContainerAnnot:  "gpu",
-	}, "sidecar", "gpu")
-	exp.reconcilePod(p)
-
-	assertGaugeValue(t, registry, "kubex_gpu_fraction", map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "gpu",
-	}, 0.5)
-}
-
-func TestInvalidAnnotationDoesNotLeakStaleMetric(t *testing.T) {
-	exp, registry := testExporter(t)
-
-	p := pod("default", "gpu-app", "node-a", map[string]string{
-		mockAnnotationPrefix + "kubex_gpu_container_memory_utilization_percent": "42",
-	}, "main")
-	exp.reconcilePod(p)
-
-	updated := p.DeepCopy()
-	updated.Annotations[mockAnnotationPrefix+"kubex_gpu_container_memory_utilization_percent"] = "nope"
-	exp.reconcilePod(updated)
-
-	assertGaugeAbsent(t, registry, "kubex_gpu_container_memory_utilization_percent")
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
+	assertMetricAbsentFromText(t, body, metricRequestsName)
 }
 
 func TestTerminalPodRemovesMetrics(t *testing.T) {
@@ -133,220 +185,113 @@ func TestTerminalPodRemovesMetrics(t *testing.T) {
 	completed.Status.Phase = corev1.PodSucceeded
 	exp.reconcilePod(completed)
 
-	assertGaugeAbsent(t, registry, "kubex_gpu_fraction")
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
+	assertMetricAbsentFromText(t, body, metricRequestsName)
 }
 
-func TestMetricsHandlerWithoutJitterEmitsAnnotationValues(t *testing.T) {
+func TestResolvesAnnotatedContainerName(t *testing.T) {
 	exp, registry := testExporter(t)
 
 	p := pod("default", "gpu-app", "node-a", map[string]string{
-		gpuFractionAnnotation: "0.25",
-		mockAnnotationPrefix + "kubex_gpu_container_memory_bytes":           "2048",
-		mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent": "73.5",
-	}, "main")
-	exp.reconcilePod(p)
-
-	body := scrapeMetrics(t, exp.metricsHandler(registry))
-
-	assertMetricValueFromText(t, body, "kubex_gpu_fraction", map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 0.25)
-	assertMetricValueFromText(t, body, "kubex_gpu_container_memory_bytes", map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 2048)
-	assertMetricValueFromText(t, body, "kubex_gpu_container_sm_utilization_percent", map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}, 73.5)
-}
-
-func TestMetricsHandlerWithJitterResamplesEligibleMetrics(t *testing.T) {
-	exp, registry := testExporterWithOptions(t, exporterOptions{
-		jitterDelta: 10,
-		randValue: sequenceFloat64(
-			0.0, 0.25,
-			0.999999, 0.75,
-		),
-	})
-
-	p := pod("default", "gpu-app", "node-a", map[string]string{
 		gpuFractionAnnotation: "0.5",
-		mockAnnotationPrefix + "kubex_gpu_container_memory_bytes":           "2048",
-		mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent": "50",
-	}, "main")
+		targetContainerAnnot:  "gpu",
+	}, "sidecar", "gpu")
 	exp.reconcilePod(p)
-
-	handler := exp.metricsHandler(registry)
-	firstBody := scrapeMetrics(t, handler)
-	secondBody := scrapeMetrics(t, handler)
-
-	labels := map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}
-	firstFraction := metricValueFromText(t, firstBody, "kubex_gpu_fraction", labels)
-	secondFraction := metricValueFromText(t, secondBody, "kubex_gpu_fraction", labels)
-	firstPercent := metricValueFromText(t, firstBody, "kubex_gpu_container_sm_utilization_percent", labels)
-	secondPercent := metricValueFromText(t, secondBody, "kubex_gpu_container_sm_utilization_percent", labels)
-
-	if firstFraction == secondFraction {
-		t.Fatalf("fraction metric did not change between scrapes: %v", firstFraction)
-	}
-	if firstPercent == secondPercent {
-		t.Fatalf("percent metric did not change between scrapes: %v", firstPercent)
-	}
-	if got := metricValueFromText(t, firstBody, "kubex_gpu_container_memory_bytes", labels); got != 2048 {
-		t.Fatalf("memory bytes on first scrape = %v, want 2048", got)
-	}
-	if got := metricValueFromText(t, secondBody, "kubex_gpu_container_memory_bytes", labels); got != 2048 {
-		t.Fatalf("memory bytes on second scrape = %v, want 2048", got)
-	}
-}
-
-func TestMetricsHandlerJitterClampsToValidRanges(t *testing.T) {
-	exp, registry := testExporterWithOptions(t, exporterOptions{
-		jitterDelta: 20,
-		randValue: sequenceFloat64(
-			0.999999, 0.999999,
-		),
-	})
-
-	p := pod("default", "gpu-app", "node-a", map[string]string{
-		gpuFractionAnnotation: "0.95",
-		mockAnnotationPrefix + "kubex_gpu_container_sm_utilization_percent": "95",
-	}, "main")
-	exp.reconcilePod(p)
-
 	body := scrapeMetrics(t, exp.metricsHandler(registry))
-	labels := map[string]string{
-		"gpu_uuid":  "mock-node-a",
-		"node":      "node-a",
-		"namespace": "default",
-		"pod":       "gpu-app",
-		"container": "main",
-	}
 
-	assertMetricValueFromText(t, body, "kubex_gpu_fraction", labels, 1)
-	assertMetricValueFromText(t, body, "kubex_gpu_container_sm_utilization_percent", labels, 100)
-}
-
-func TestLoadMetricJitterDelta(t *testing.T) {
-	tests := []struct {
-		name    string
-		value   string
-		want    float64
-		wantErr bool
-	}{
-		{name: "unset", want: 0},
-		{name: "zero", value: "0", want: 0},
-		{name: "positive", value: "3.5", want: 3.5},
-		{name: "negative", value: "-1", wantErr: true},
-		{name: "invalid", value: "abc", wantErr: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.value == "" {
-				t.Setenv(metricJitterAbsoluteDeltaEnv, "")
-			} else {
-				t.Setenv(metricJitterAbsoluteDeltaEnv, tc.value)
-			}
-
-			got, err := loadMetricJitterDelta()
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("loadMetricJitterDelta returned error: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("loadMetricJitterDelta = %v, want %v", got, tc.want)
-			}
-		})
-	}
+	assertMetricValueFromText(t, body, metricRequestsName, map[string]string{
+		"node":                "node-a",
+		"namespace":           "default",
+		"pod":                 "gpu-app",
+		"container":           "gpu",
+		"container_id":        "mock://default/gpu-app/gpu",
+		"gpu_allocation_type": kaiSchedulerAllocationType,
+	}, 0.5)
 }
 
 func testExporter(t *testing.T) (*exporter, *prometheus.Registry) {
 	t.Helper()
-
 	return testExporterWithOptions(t, exporterOptions{})
 }
 
 func testExporterWithOptions(t *testing.T, opts exporterOptions) (*exporter, *prometheus.Registry) {
 	t.Helper()
-
 	registry := prometheus.NewRegistry()
 	logger := log.New(&bytes.Buffer{}, "", 0)
 	return newExporter("node-a", registry, logger, opts), registry
 }
 
-func assertGaugeValue(t *testing.T, registry *prometheus.Registry, metricName string, wantLabels map[string]string, wantValue float64) {
+func scrapeMetrics(t *testing.T, handler http.Handler) string {
 	t.Helper()
-
-	families, err := registry.Gather()
-	if err != nil {
-		t.Fatalf("gather metrics: %v", err)
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("scrape status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-
-	for _, family := range families {
-		if family.GetName() != metricName {
-			continue
-		}
-		for _, metric := range family.GetMetric() {
-			labels := make(map[string]string, len(metric.GetLabel()))
-			for _, pair := range metric.GetLabel() {
-				labels[pair.GetName()] = pair.GetValue()
-			}
-			if sameLabels(labels, wantLabels) {
-				if metric.GetGauge().GetValue() != wantValue {
-					t.Fatalf("metric %s value = %v, want %v", metricName, metric.GetGauge().GetValue(), wantValue)
-				}
-				return
-			}
-		}
-	}
-
-	t.Fatalf("metric %s with labels %v not found", metricName, wantLabels)
+	return recorder.Body.String()
 }
 
-func assertGaugeAbsent(t *testing.T, registry *prometheus.Registry, metricName string) {
+func assertMetricValueFromText(t *testing.T, body, metricName string, wantLabels map[string]string, wantValue float64) {
 	t.Helper()
-
-	var buf bytes.Buffer
-	encoder := expfmt.NewEncoder(&buf, expfmt.FmtText)
-	families, err := registry.Gather()
-	if err != nil {
-		t.Fatalf("gather metrics: %v", err)
+	if got := metricValueFromText(t, body, metricName, wantLabels); got != wantValue {
+		t.Fatalf("metric %s value = %v, want %v", metricName, got, wantValue)
 	}
-	for _, family := range families {
-		if family.GetName() != metricName {
+}
+
+func metricValueFromText(t *testing.T, body, metricName string, wantLabels map[string]string) float64 {
+	t.Helper()
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	prefix := metricName + "{"
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
-		if len(family.GetMetric()) > 0 {
-			if err := encoder.Encode(family); err != nil {
-				t.Fatalf("encode metric family: %v", err)
-			}
-			t.Fatalf("metric %s unexpectedly present:\n%s", metricName, buf.String())
+		labelsPart, valuePart, ok := strings.Cut(strings.TrimPrefix(line, metricName), "} ")
+		if !ok || !strings.HasPrefix(labelsPart, "{") {
+			continue
 		}
-		return
+		labels := parseMetricLabels(t, strings.TrimPrefix(labelsPart, "{"))
+		if !sameLabels(labels, wantLabels) {
+			continue
+		}
+		value, err := strconv.ParseFloat(strings.TrimSpace(valuePart), 64)
+		if err != nil {
+			t.Fatalf("parse metric value %q: %v", valuePart, err)
+		}
+		return value
 	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan metrics: %v", err)
+	}
+	t.Fatalf("metric %s with labels %v not found", metricName, wantLabels)
+	return 0
+}
+
+func assertMetricAbsentFromText(t *testing.T, body, metricName string) {
+	t.Helper()
+	if strings.Contains(body, metricName+"{") {
+		t.Fatalf("metric %s unexpectedly present in scrape:\n%s", metricName, body)
+	}
+}
+
+func parseMetricLabels(t *testing.T, raw string) map[string]string {
+	t.Helper()
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	labels := make(map[string]string, len(parts))
+	for _, part := range parts {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			t.Fatalf("invalid label pair %q", part)
+		}
+		labels[key] = strings.Trim(value, "\"")
+	}
+	return labels
 }
 
 func sameLabels(got, want map[string]string) bool {
@@ -361,95 +306,54 @@ func sameLabels(got, want map[string]string) bool {
 	return true
 }
 
-func scrapeMetrics(t *testing.T, handler http.Handler) string {
-	t.Helper()
-
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("scrape status = %d, want %d", recorder.Code, http.StatusOK)
+func copyLabels(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
 	}
-
-	return recorder.Body.String()
+	return dst
 }
 
-func assertMetricValueFromText(t *testing.T, body, metricName string, wantLabels map[string]string, wantValue float64) {
-	t.Helper()
+func TestMetricTypes(t *testing.T) {
+	exp, registry := testExporter(t)
+	p := pod("default", "gpu-app", "node-a", map[string]string{
+		gpuFractionAnnotation:            "0.25",
+		metricMemoryBytesAnnotation:      "2048",
+		metricMemoryTotalBytesAnnotation: "4096",
+		metricSMUtilPercentAnnotation:    "10",
+	}, "main")
+	exp.reconcilePod(p)
+	_ = scrapeMetrics(t, exp.metricsHandler(registry))
 
-	if got := metricValueFromText(t, body, metricName, wantLabels); got != wantValue {
-		t.Fatalf("metric %s value = %v, want %v", metricName, got, wantValue)
+	var buf bytes.Buffer
+	encoder := expfmt.NewEncoder(&buf, expfmt.FmtText)
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
 	}
-}
-
-func metricValueFromText(t *testing.T, body, metricName string, wantLabels map[string]string) float64 {
-	t.Helper()
-
-	scanner := bufio.NewScanner(strings.NewReader(body))
-	prefix := metricName + "{"
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, prefix) {
-			continue
+	for _, family := range families {
+		if err := encoder.Encode(family); err != nil {
+			t.Fatalf("encode metric family: %v", err)
 		}
-
-		labelsPart, valuePart, ok := strings.Cut(strings.TrimPrefix(line, metricName), "} ")
-		if !ok || !strings.HasPrefix(labelsPart, "{") {
-			continue
-		}
-
-		labels := parseMetricLabels(t, strings.TrimPrefix(labelsPart, "{"))
-		if !sameLabels(labels, wantLabels) {
-			continue
-		}
-
-		value, err := strconv.ParseFloat(strings.TrimSpace(valuePart), 64)
-		if err != nil {
-			t.Fatalf("parse metric value %q: %v", valuePart, err)
-		}
-		return value
 	}
-	if err := scanner.Err(); err != nil {
-		t.Fatalf("scan metrics: %v", err)
-	}
-
-	t.Fatalf("metric %s with labels %v not found", metricName, wantLabels)
-	return 0
-}
-
-func parseMetricLabels(t *testing.T, raw string) map[string]string {
-	t.Helper()
-
-	if raw == "" {
-		return nil
-	}
-
-	parts := strings.Split(raw, ",")
-	labels := make(map[string]string, len(parts))
-	for _, part := range parts {
-		key, value, ok := strings.Cut(part, "=")
-		if !ok {
-			t.Fatalf("invalid label pair %q", part)
+	body := buf.String()
+	for _, metricName := range []string{
+		metricRequestsName,
+		metricLimitsName,
+		metricSMUtilName,
+		metricMemoryFootprintName,
+	} {
+		if !strings.Contains(body, "# TYPE "+metricName+" gauge") {
+			t.Fatalf("expected gauge type for %s:\n%s", metricName, body)
 		}
-		labels[key] = strings.Trim(value, "\"")
 	}
-
-	return labels
-}
-
-func sequenceFloat64(values ...float64) func() float64 {
-	index := 0
-	return func() float64 {
-		if len(values) == 0 {
-			return 0
+	for _, metricName := range []string{
+		"kubex_gpu_container_memory_bytes",
+		"kubex_gpu_container_memory_total_bytes",
+		"kubex_gpu_container_sm_utilization_percent_seconds_total",
+	} {
+		if strings.Contains(body, "# TYPE "+metricName+" ") {
+			t.Fatalf("unexpected type line for %s:\n%s", metricName, body)
 		}
-		if index >= len(values) {
-			return values[len(values)-1]
-		}
-		value := values[index]
-		index++
-		return value
 	}
 }

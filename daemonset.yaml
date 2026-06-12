@@ -55,8 +55,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: METRIC_JITTER_ABSOLUTE_DELTA
-              value: "2"
           ports:
             - name: metrics
               containerPort: 8080
