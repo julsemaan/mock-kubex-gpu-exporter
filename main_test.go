@@ -8,7 +8,13 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"k8s.io/client-go/tools/cache"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
@@ -49,9 +55,8 @@ func TestReconcileAnnotatedPodExportsConsumedMetrics(t *testing.T) {
 	assertMetricValueFromText(t, body, metricSMUtilName, perDeviceLabels, 73.5)
 
 	assertMetricAbsentFromText(t, body, "kubex_gpu_fraction")
-	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_bytes")
-	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_total_bytes")
-	assertMetricAbsentFromText(t, body, "kubex_gpu_container_sm_utilization_percent_seconds_total")
+	assertMetricValueFromText(t, body, "kubex_gpu_container_memory_bytes", perDeviceLabels, 2048)
+	assertMetricValueFromText(t, body, "kubex_gpu_container_memory_total_bytes", perDeviceLabels, 4096)
 	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_utilization_percent")
 }
 
@@ -209,6 +214,235 @@ func TestResolvesAnnotatedContainerName(t *testing.T) {
 	}, 0.5)
 }
 
+const cumulativeTestMetric = "kubex_gpu_container_sm_utilization_percent_seconds_total"
+
+func TestCumulativeUtilizationUsesElapsedTimeAndOldValue(t *testing.T) {
+	for _, frequent := range []bool{false, true} {
+		t.Run(strconv.FormatBool(frequent), func(t *testing.T) {
+			now := time.Unix(100, 0)
+			exp, registry := testExporterWithOptions(t, exporterOptions{now: func() time.Time { return now }})
+			handler := exp.metricsHandler(registry)
+			p := pod("default", "gpu-app", "node-a", map[string]string{metricSMUtilPercentAnnotation: "25"}, "main")
+			exp.onAdd(p)
+			assertMetricValueFromText(t, scrapeMetrics(t, handler), cumulativeTestMetric, defaultTestLabels(), 0)
+			for i := 0; i < 4; i++ {
+				now = now.Add(250 * time.Millisecond)
+				if frequent {
+					_ = scrapeMetrics(t, handler)
+				}
+			}
+			p.Annotations[metricSMUtilPercentAnnotation] = "75"
+			exp.onUpdate(nil, p)
+			now = now.Add(2 * time.Second)
+			assertMetricValueFromText(t, scrapeMetrics(t, handler), cumulativeTestMetric, defaultTestLabels(), 175)
+			assertMetricValueFromText(t, scrapeMetrics(t, handler), cumulativeTestMetric, defaultTestLabels(), 175)
+			exp.onUpdate(nil, p)
+			now = now.Add(time.Second)
+			assertMetricValueFromText(t, scrapeMetrics(t, handler), cumulativeTestMetric, defaultTestLabels(), 250)
+		})
+	}
+}
+
+func TestTelemetryCleanupAndRestart(t *testing.T) {
+	for _, action := range []string{"annotation removal", "invalid", "NaN", "+Inf", "-Inf", "succeeded", "failed", "delete", "tombstone", "pointer tombstone", "node move"} {
+		t.Run(action, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			exp, registry := testExporterWithOptions(t, exporterOptions{now: func() time.Time { return now }})
+			p := pod("default", "gpu-app", "node-a", map[string]string{
+				metricSMUtilPercentAnnotation: "50", metricMemoryBytesAnnotation: "10", metricMemoryTotalBytesAnnotation: "20",
+			}, "main")
+			exp.onAdd(p)
+			now = now.Add(time.Second)
+			assertMetricValueFromText(t, scrapeMetrics(t, exp.metricsHandler(registry)), cumulativeTestMetric, defaultTestLabels(), 50)
+			updated := p.DeepCopy()
+			switch action {
+			case "annotation removal":
+				updated.Annotations = nil
+			case "invalid", "NaN", "+Inf", "-Inf":
+				for key := range updated.Annotations {
+					updated.Annotations[key] = action
+				}
+			case "succeeded":
+				updated.Status.Phase = corev1.PodSucceeded
+			case "failed":
+				updated.Status.Phase = corev1.PodFailed
+			case "delete":
+				exp.onDelete(p)
+			case "tombstone":
+				exp.onDelete(cache.DeletedFinalStateUnknown{Obj: p})
+			case "pointer tombstone":
+				exp.onDelete(&cache.DeletedFinalStateUnknown{Obj: p})
+			case "node move":
+				updated.Spec.NodeName = "node-b"
+			}
+			if action != "delete" && !strings.Contains(action, "tombstone") {
+				exp.onUpdate(p, updated)
+			}
+			now = now.Add(time.Hour)
+			body := scrapeMetrics(t, exp.metricsHandler(registry))
+			for _, name := range []string{metricSMUtilName, cumulativeTestMetric, "kubex_gpu_container_memory_bytes", "kubex_gpu_container_memory_total_bytes", metricMemoryFootprintName} {
+				assertMetricAbsentFromText(t, body, name)
+			}
+			exp.onAdd(p)
+			assertMetricValueFromText(t, scrapeMetrics(t, exp.metricsHandler(registry)), cumulativeTestMetric, defaultTestLabels(), 0)
+		})
+	}
+}
+
+func TestIdentityChangesRemoveOldSeries(t *testing.T) {
+	for _, identity := range []string{"uuid", "model", "container"} {
+		t.Run(identity, func(t *testing.T) {
+			now := time.Unix(100, 0)
+			exp, registry := testExporterWithOptions(t, exporterOptions{now: func() time.Time { return now }})
+			p := pod("default", "gpu-app", "node-a", map[string]string{metricSMUtilPercentAnnotation: "20", metricMemoryBytesAnnotation: "10", metricMemoryTotalBytesAnnotation: "20"}, "main", "gpu")
+			exp.onAdd(p)
+			now = now.Add(time.Second)
+			labels := defaultTestLabels()
+			switch identity {
+			case "uuid":
+				p.Annotations[mockGPUUUIDAnnotation] = "new-uuid"
+				labels["gpu_uuid"] = "new-uuid"
+			case "model":
+				p.Annotations[mockGPUModelAnnotation] = "new-model"
+				labels["gpu_model"] = "new-model"
+			case "container":
+				p.Annotations[targetContainerAnnot] = "gpu"
+				labels["container"] = "gpu"
+				labels["container_id"] = "mock://default/gpu-app/gpu"
+			}
+			exp.onUpdate(nil, p)
+			now = now.Add(2 * time.Second)
+			body := scrapeMetrics(t, exp.metricsHandler(registry))
+			for name, value := range map[string]float64{cumulativeTestMetric: 40, metricSMUtilName: 20, "kubex_gpu_container_memory_bytes": 10, "kubex_gpu_container_memory_total_bytes": 20, metricMemoryFootprintName: 50} {
+				assertMetricValueFromText(t, body, name, labels, value)
+				if strings.Count(body, name+"{") != 1 {
+					t.Fatalf("old %s identity still present:\n%s", name, body)
+				}
+			}
+		})
+	}
+}
+
+func TestMemoryByteGaugesAreIndependent(t *testing.T) {
+	exp, registry := testExporter(t)
+	p := pod("default", "gpu-app", "node-a", map[string]string{metricMemoryBytesAnnotation: "1024"}, "main")
+	exp.onAdd(p)
+	body := scrapeMetrics(t, exp.metricsHandler(registry))
+	assertMetricValueFromText(t, body, "kubex_gpu_container_memory_bytes", defaultTestLabels(), 1024)
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_total_bytes")
+	assertMetricAbsentFromText(t, body, metricMemoryFootprintName)
+	delete(p.Annotations, metricMemoryBytesAnnotation)
+	p.Annotations[metricMemoryTotalBytesAnnotation] = "0"
+	exp.onUpdate(nil, p)
+	body = scrapeMetrics(t, exp.metricsHandler(registry))
+	assertMetricAbsentFromText(t, body, "kubex_gpu_container_memory_bytes")
+	assertMetricValueFromText(t, body, "kubex_gpu_container_memory_total_bytes", defaultTestLabels(), 0)
+	assertMetricAbsentFromText(t, body, metricMemoryFootprintName)
+}
+
+func TestConcurrentCollectionAndUpdates(t *testing.T) {
+	exp, registry := testExporter(t)
+	p := pod("default", "gpu-app", "node-a", map[string]string{metricSMUtilPercentAnnotation: "50"}, "main")
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			exp.onAdd(p)
+			exp.onDelete(p)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if _, err := registry.Gather(); err != nil {
+				t.Errorf("concurrent gather: %v", err)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestWholeGPUResourcesAndFractionOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name, fraction, target string
+		requests, limits       float64
+	}{
+		{"first container", "", "", 2, 3},
+		{"selected container", "", "gpu", 4, 5},
+		{"fraction overrides", "0.25", "gpu", 0.25, 0.25},
+		{"fraction clamps", "2", "gpu", 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exp, registry := testExporter(t)
+			p := pod("default", "gpu-app", "node-a", map[string]string{targetContainerAnnot: tc.target}, "main", "gpu")
+			p.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("2")},
+				Limits:   corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("3")},
+			}
+			p.Spec.Containers[1].Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")},
+				Limits:   corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("5")},
+			}
+			if tc.fraction != "" {
+				p.Annotations[gpuFractionAnnotation] = tc.fraction
+			}
+			exp.reconcilePod(p)
+			body := scrapeMetrics(t, exp.metricsHandler(registry))
+			labels := defaultTestLabels()
+			delete(labels, "gpu_uuid")
+			delete(labels, "gpu_model")
+			if tc.target != "" {
+				labels["container"] = tc.target
+				labels["container_id"] = "mock://default/gpu-app/" + tc.target
+			}
+			assertMetricValueFromText(t, body, metricRequestsName, labels, tc.requests)
+			assertMetricValueFromText(t, body, metricLimitsName, labels, tc.limits)
+			delete(p.Annotations, gpuFractionAnnotation)
+			p.Spec.Containers[0].Resources.Requests = nil
+			p.Spec.Containers[1].Resources.Requests = nil
+			exp.reconcilePod(p)
+			body = scrapeMetrics(t, exp.metricsHandler(registry))
+			assertMetricAbsentFromText(t, body, metricRequestsName)
+			wantLimit := 3.0
+			if tc.target != "" {
+				wantLimit = 5
+			}
+			assertMetricValueFromText(t, body, metricLimitsName, labels, wantLimit)
+		})
+	}
+}
+
+func defaultTestLabels() map[string]string {
+	return map[string]string{
+		"node": "node-a", "namespace": "default", "pod": "gpu-app", "container": "main",
+		"container_id": "mock://default/gpu-app/main", "gpu_allocation_type": kaiSchedulerAllocationType,
+		"gpu_uuid": "mock-node-a", "gpu_model": defaultMockGPUModelLabel,
+	}
+}
+
+func TestNonfiniteAnnotationsRemoveMetrics(t *testing.T) {
+	for _, invalid := range []string{"NaN", "+Inf", "-Inf", "bad", ""} {
+		t.Run(invalid, func(t *testing.T) {
+			exp, registry := testExporter(t)
+			p := pod("default", "gpu-app", "node-a", map[string]string{
+				gpuFractionAnnotation: "0.5", metricMemoryBytesAnnotation: "10",
+				metricMemoryTotalBytesAnnotation: "20", metricSMUtilPercentAnnotation: "50",
+			}, "main")
+			exp.reconcilePod(p)
+			for key := range p.Annotations {
+				p.Annotations[key] = invalid
+			}
+			exp.reconcilePod(p)
+			body := scrapeMetrics(t, exp.metricsHandler(registry))
+			for _, name := range []string{metricRequestsName, metricLimitsName, metricMemoryFootprintName, metricSMUtilName,
+				"kubex_gpu_container_memory_bytes", "kubex_gpu_container_memory_total_bytes", "kubex_gpu_container_sm_utilization_percent_seconds_total"} {
+				assertMetricAbsentFromText(t, body, name)
+			}
+		})
+	}
+}
+
 func testExporter(t *testing.T) (*exporter, *prometheus.Registry) {
 	t.Helper()
 	return testExporterWithOptions(t, exporterOptions{})
@@ -342,18 +576,14 @@ func TestMetricTypes(t *testing.T) {
 		metricLimitsName,
 		metricSMUtilName,
 		metricMemoryFootprintName,
+		"kubex_gpu_container_memory_bytes",
+		"kubex_gpu_container_memory_total_bytes",
 	} {
 		if !strings.Contains(body, "# TYPE "+metricName+" gauge") {
 			t.Fatalf("expected gauge type for %s:\n%s", metricName, body)
 		}
 	}
-	for _, metricName := range []string{
-		"kubex_gpu_container_memory_bytes",
-		"kubex_gpu_container_memory_total_bytes",
-		"kubex_gpu_container_sm_utilization_percent_seconds_total",
-	} {
-		if strings.Contains(body, "# TYPE "+metricName+" ") {
-			t.Fatalf("unexpected type line for %s:\n%s", metricName, body)
-		}
+	if !strings.Contains(body, "# TYPE kubex_gpu_container_sm_utilization_percent_seconds_total counter") {
+		t.Fatalf("expected cumulative utilization counter:\n%s", body)
 	}
 }

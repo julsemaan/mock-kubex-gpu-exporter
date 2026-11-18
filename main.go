@@ -3,11 +3,13 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -43,9 +45,12 @@ const (
 	metricLimitsName          = "kubex_gpu_container_limits"
 	metricMemoryFootprintName = "kubex_gpu_container_memory_footprint_percent"
 	metricSMUtilName          = "kubex_gpu_container_sm_utilization_percent"
+	metricSMUtilSecondsName   = "kubex_gpu_container_sm_utilization_percent_seconds_total"
+	metricMemoryBytesName     = "kubex_gpu_container_memory_bytes"
+	metricMemoryTotalName     = "kubex_gpu_container_memory_total_bytes"
 
-	metricMemoryBytesAnnotation      = mockAnnotationPrefix + "kubex_gpu_container_memory_bytes"
-	metricMemoryTotalBytesAnnotation = mockAnnotationPrefix + "kubex_gpu_container_memory_total_bytes"
+	metricMemoryBytesAnnotation      = mockAnnotationPrefix + metricMemoryBytesName
+	metricMemoryTotalBytesAnnotation = mockAnnotationPrefix + metricMemoryTotalName
 	metricSMUtilPercentAnnotation    = mockAnnotationPrefix + metricSMUtilName
 )
 
@@ -53,6 +58,8 @@ type gaugeSeries struct {
 	metricName string
 	labels     []string
 	value      float64
+	total      float64
+	last       time.Time
 }
 
 func (s gaugeSeries) key() string {
@@ -62,13 +69,17 @@ func (s gaugeSeries) key() string {
 type exporter struct {
 	nodeName string
 	logger   *log.Logger
+	now      func() time.Time
+	utilDesc *prometheus.Desc
 
 	mu           sync.Mutex
 	gaugeMetrics map[string]*prometheus.GaugeVec
 	podGauges    map[types.UID]map[string]gaugeSeries
 }
 
-type exporterOptions struct{}
+type exporterOptions struct {
+	now func() time.Time
+}
 
 func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
@@ -147,26 +158,65 @@ func newPodInformer(clientset kubernetes.Interface, nodeName string) cache.Share
 	)
 }
 
-func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger, _ exporterOptions) *exporter {
+func newExporter(nodeName string, registerer prometheus.Registerer, logger *log.Logger, opts exporterOptions) *exporter {
 	gaugeMetrics := map[string]*prometheus.GaugeVec{
 		metricRequestsName:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricRequestsName, Help: "Number or fraction of GPUs"}, containerLabelNames),
 		metricLimitsName:          prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricLimitsName, Help: "Number or fraction of GPUs"}, containerLabelNames),
 		metricMemoryFootprintName: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricMemoryFootprintName, Help: "Percent"}, perDeviceLabelNames),
 		metricSMUtilName:          prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricSMUtilName, Help: "Percent"}, perDeviceLabelNames),
-	}
-	for _, gauge := range gaugeMetrics {
-		registerer.MustRegister(gauge)
+		metricMemoryBytesName:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricMemoryBytesName, Help: "GPU memory used in bytes"}, perDeviceLabelNames),
+		metricMemoryTotalName:     prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: metricMemoryTotalName, Help: "Total GPU memory in bytes"}, perDeviceLabelNames),
 	}
 
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
 
-	return &exporter{
+	if opts.now == nil {
+		opts.now = time.Now
+	}
+	e := &exporter{
+		now:          opts.now,
+		utilDesc:     prometheus.NewDesc(metricSMUtilSecondsName, "Cumulative SM utilization in percent-seconds", perDeviceLabelNames, nil),
 		nodeName:     nodeName,
 		logger:       logger,
 		gaugeMetrics: gaugeMetrics,
 		podGauges:    make(map[types.UID]map[string]gaugeSeries),
+	}
+	registerer.MustRegister(e)
+	return e
+}
+
+func (e *exporter) Describe(ch chan<- *prometheus.Desc) {
+	for _, gauge := range e.gaugeMetrics {
+		gauge.Describe(ch)
+	}
+	ch <- e.utilDesc
+}
+
+func (e *exporter) Collect(ch chan<- prometheus.Metric) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	now := e.now()
+	for _, seriesByKey := range e.podGauges {
+		for key, series := range seriesByKey {
+			if series.metricName == metricSMUtilName {
+				series.integrate(now)
+				seriesByKey[key] = series
+				ch <- prometheus.MustNewConstMetric(e.utilDesc, prometheus.CounterValue, series.total, series.labels...)
+			}
+		}
+	}
+	for _, gauge := range e.gaugeMetrics {
+		gauge.Collect(ch)
+	}
+}
+
+func (s *gaugeSeries) integrate(now time.Time) {
+	if now.After(s.last) {
+		s.total += s.value * now.Sub(s.last).Seconds()
+		s.last = now
 	}
 }
 
@@ -236,16 +286,46 @@ func (e *exporter) desiredSeriesForPod(pod *corev1.Pod) map[string]gaugeSeries {
 
 	gaugeSeriesByKey := make(map[string]gaugeSeries, 4)
 
-	if fraction, ok := parseAnnotationFloat(e, pod, gpuFractionAnnotation); ok {
-		fraction = clamp(fraction, 0, 1)
-		for _, metricName := range []string{metricRequestsName, metricLimitsName} {
-			series := gaugeSeries{metricName: metricName, labels: append([]string(nil), containerLabels...), value: fraction}
-			gaugeSeriesByKey[series.key()] = series
+	if _, hasFraction := pod.Annotations[gpuFractionAnnotation]; hasFraction {
+		if fraction, ok := parseAnnotationFloat(e, pod, gpuFractionAnnotation); ok {
+			fraction = clamp(fraction, 0, 1)
+			for _, metricName := range []string{metricRequestsName, metricLimitsName} {
+				series := gaugeSeries{metricName: metricName, labels: append([]string(nil), containerLabels...), value: fraction}
+				gaugeSeriesByKey[series.key()] = series
+			}
+		}
+	} else {
+		for _, container := range pod.Spec.Containers {
+			if container.Name != containerName {
+				continue
+			}
+			for metricName, resources := range map[string]corev1.ResourceList{
+				metricRequestsName: container.Resources.Requests,
+				metricLimitsName:   container.Resources.Limits,
+			} {
+				if quantity, ok := resources["nvidia.com/gpu"]; ok {
+					series := gaugeSeries{metricName: metricName, labels: containerLabels, value: quantity.AsApproximateFloat64()}
+					gaugeSeriesByKey[series.key()] = series
+				}
+			}
+			break
 		}
 	}
 
 	memoryBytes, hasMemoryBytes := parseAnnotationFloat(e, pod, metricMemoryBytesAnnotation)
 	memoryTotalBytes, hasMemoryTotalBytes := parseAnnotationFloat(e, pod, metricMemoryTotalBytesAnnotation)
+	for metricName, sample := range map[string]struct {
+		value float64
+		valid bool
+	}{
+		metricMemoryBytesName: {memoryBytes, hasMemoryBytes},
+		metricMemoryTotalName: {memoryTotalBytes, hasMemoryTotalBytes},
+	} {
+		if sample.valid {
+			series := gaugeSeries{metricName: metricName, labels: perDeviceLabels, value: sample.value}
+			gaugeSeriesByKey[series.key()] = series
+		}
+	}
 	if hasMemoryBytes && hasMemoryTotalBytes && memoryTotalBytes > 0 {
 		footprint := clamp((memoryBytes/memoryTotalBytes)*100, 0, 100)
 		series := gaugeSeries{metricName: metricMemoryFootprintName, labels: append([]string(nil), perDeviceLabels...), value: footprint}
@@ -266,8 +346,8 @@ func parseAnnotationFloat(e *exporter, pod *corev1.Pod, annotationKey string) (f
 		return 0, false
 	}
 	value, err := strconv.ParseFloat(strings.TrimSpace(rawValue), 64)
-	if err != nil {
-		e.logger.Printf("skipping invalid annotation %q on %s/%s: %v", annotationKey, pod.Namespace, pod.Name, err)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		e.logger.Printf("skipping invalid annotation %q = %q on %s/%s", annotationKey, rawValue, pod.Namespace, pod.Name)
 		return 0, false
 	}
 	return value, true
@@ -294,7 +374,15 @@ func (e *exporter) applySeries(podUID types.UID, desiredGauges map[string]gaugeS
 		existingGauges = make(map[string]gaugeSeries, len(desiredGauges))
 		e.podGauges[podUID] = existingGauges
 	}
+	now := e.now()
 	for key, series := range desiredGauges {
+		if series.metricName == metricSMUtilName {
+			if old, ok := existingGauges[key]; ok {
+				old.integrate(now)
+				series.total = old.total
+			}
+			series.last = now
+		}
 		e.gaugeMetrics[series.metricName].WithLabelValues(series.labels...).Set(series.value)
 		existingGauges[key] = series
 	}
@@ -340,6 +428,10 @@ func podFromDeletedObject(obj interface{}) *corev1.Pod {
 	switch t := obj.(type) {
 	case *corev1.Pod:
 		return t
+	case *cache.DeletedFinalStateUnknown:
+		if t != nil {
+			return podFromDeletedObject(t.Obj)
+		}
 	case cache.DeletedFinalStateUnknown:
 		if pod, ok := t.Obj.(*corev1.Pod); ok {
 			return pod
